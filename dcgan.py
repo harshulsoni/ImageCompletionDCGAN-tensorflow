@@ -4,10 +4,12 @@ import parameters as parameters
 
 print(tf.__version__)
 
-def DCGAN():
+def DCGAN(batch_size=parameters.batch_size, learning_rate=1e-4):
 	with tf.variable_scope('generator'):
-		z=tf.placeholder(tf.float32, [parameters.batch_size, parameters.z_len])
+		#z=tf.random_normal([batch_size, 64, 64, 3], mean=0, stddev=0.01, dtype=tf.float32)	
+		z=tf.placeholder(tf.float32, [batch_size, parameters.z_len])
 		training=tf.placeholder(tf.bool, name='training_phase')
+		GenTrain=tf.placeholder(tf.bool, name='Generator_Train_on')
 		def fully_connected_layer(input, name, in_size, out_size):
 			with tf.variable_scope(name):
 				weights=tf.get_variable("weights", [in_size, out_size], initializer=tf.random_normal_initializer(0, 0.01))
@@ -20,7 +22,7 @@ def DCGAN():
 			layer2=fully_connected_layer(layer1, 'layer2', 256, 1024)
 			layer3=fully_connected_layer(layer2, 'layer3', 1024, 1024*4*4)
 		with tf.variable_scope('flattening'):
-			outputs=tf.reshape(layer3, [-1, 4, 4, 1024])
+			outputs=tf.reshape(layer3, [batch_size, 4, 4, 1024])
 			outputs=tf.nn.relu(tf.layers.batch_normalization(outputs, training=training), name='outputs')
 		def deconvlayer(input, name, in_channels, out_channels):
 			with tf.variable_scope(name):
@@ -39,24 +41,18 @@ def DCGAN():
 	}'''
 
 	with tf.variable_scope('discriminator'):
-		x_images=tf.placeholder(tf.float32, [parameters.batch_size, 64, 64, 3])
-		training=tf.placeholder(tf.bool, name='training_phase')
-		#y_images=tf.placeholder(tf.float32, [parameters.batch_size, parameters.num_classes])
-		with tf.variable_scope('prepare_input_and_shuffle'):
-			y_i=tf.ones([parameters.batch_size, 1], tf.float32)
-			y_f=tf.zeros([parameters.batch_size, 1], tf.float32)
+		x_images=tf.placeholder(tf.float32, [batch_size, 64, 64, 3])
+		with tf.variable_scope('prepare_input'):
+			y_i=tf.ones([batch_size, 1], tf.float32)
+			y_f=tf.zeros([batch_size, 1], tf.float32)
 			y_images=tf.concat([y_f, y_i], 1)
 			y_fake=tf.concat([y_i, y_f], 1)
-			x=tf.concat([dconv4, x_images], 0)
-			x_shape=x.get_shape()
-			x=tf.reshape(x, [2*parameters.batch_size, -1])
-			y=tf.concat([y_fake, y_images], 0)
-			y=tf.reshape(y, [2*parameters.batch_size, -1])
-			x_temp=tf.concat([x, y], 1)
-			x_temp=tf.random_shuffle(x_temp, name='shuffle')
-			x=tf.slice(x_temp, [0, 0], [2*parameters.batch_size, int(x_shape[1])*int(x_shape[2])*int(x_shape[3])], name='slicing_x')
-			x=tf.reshape(x, [2*parameters.batch_size, int(x_shape[1]),int(x_shape[2]),int(x_shape[3])])
-			y=tf.slice(x_temp, [0, int(x_shape[1])*int(x_shape[2])*int(x_shape[3])], [2*parameters.batch_size, 2], name='slicing_y')
+			def callablefnc(input):
+				return input
+			x=tf.cond(GenTrain, lambda: callablefnc(dconv4),lambda: tf.concat([dconv4, x_images], 0))
+			x=tf.reshape(x, [-1,64,64,3])
+			y=tf.cond(GenTrain, lambda: callablefnc(y_images),lambda: tf.concat([y_fake, y_images], 0))
+			y=tf.reshape(y, [-1, 2])
 		def convlayer(input, name, in_channels, out_channels):
 			with tf.variable_scope(name):
 				w_filter=tf.get_variable("w_filter", [5, 5, in_channels, out_channels], initializer=tf.random_normal_initializer(0, 0.01))
@@ -71,7 +67,7 @@ def DCGAN():
 		conv4=convlayer(conv3, 'Convolution4', 256, 512)
 		with tf.variable_scope('Conv4_Flattening'):
 			conv4_shape=conv4.get_shape()
-			q=conv4_shape[1]*conv4_shape[2]*conv4_shape[3]
+			q=int(conv4_shape[1])*int(conv4_shape[2])*int(conv4_shape[3])
 			q=int(q)
 			#h_pool2_flat=tf.reshape(h_pool2, [-1, 4*4*64])
 			conv4_flat=tf.reshape(conv4, [-1, q])
@@ -89,17 +85,35 @@ def DCGAN():
 		predictions=tf.nn.softmax(layer3)
 		output=tf.argmax(predictions, 1)
 		d_variables = tf.get_collection(tf.GraphKeys.TRAINABLE_VARIABLES, scope='discriminator')
-		d_loss=tf.reduce_mean(tf.nn.softmax_cross_entropy_with_logits(logits=layer3, labels=y))
-		d_train=tf.train.AdamOptimizer(1e-4).minimize(d_loss, var_list=d_variables)
+		with tf.variable_scope('loss'):
+			loss=tf.reduce_mean(tf.nn.softmax_cross_entropy_with_logits(logits=layer3, labels=y))
+		with tf.variable_scope('training'):
+			d_train=tf.train.AdamOptimizer(learning_rate).minimize(loss, var_list=d_variables)
+			g_train=tf.train.AdamOptimizer(learning_rate).minimize(loss, var_list=g_variables)
 		saver=tf.train.Saver()
-	'''return dict{
-		x=x,
-		y=y,
+
+	with tf.variable_scope('ImageCompletion'):
+		mask=tf.placeholder(tf.float32, [None, 64, 64, 3])
+		#x_images
+		#z
+		#set GenTrain =True
+		contextual_loss=tf.reduce_sum(tf.reduce_sum(tf.abs(tf.multiply(mask, dconv4)-tf.multiply(mask, x_images)), 1), 0)
+		perceptual_loss=loss
+		total_loss=contextual_loss+0.1*perceptual_loss
+		grad_loss=tf.gradients(total_loss, z)
+	
+	return dict(
+		x=x_images,
+		mask=mask,
+		z=z,
 		training=training,
-		variables=d_variables,
-		loss=d_loss,
-		train=d_train
-		predictions=predictions,
-		output=output,
+		GenTrain=GenTrain,
+		loss=loss,
+		d_train=d_train,
+		g_train=g_train,
+		output=dconv4,
 		saver=saver
-	}'''
+	)
+
+dc=DCGAN()
+
